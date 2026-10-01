@@ -99,8 +99,13 @@ doEvent.climateYear = function(sim, eventTime, eventType) {
       fns <- Filenames(sim$currentClimateRasters)
       fn <- file.path(unique(dirname(fns)), 
                       paste0(paste(rasToGet, sim$.runName, Sys.getpid(), sep = "_"), ".tif"))
+      ## only the current year's file is kept: remove the previous year's before writing this one
+      if (!is.null(mod$currentFile) && file.exists(mod$currentFile)) {
+        unlink(mod$currentFile)
+      }
       sim$currentClimateRasters <- writeRaster(sim$currentClimateRasters, 
                                                filename = fn, overwrite = TRUE)
+      mod$currentFile <- fn
       
       sim$climateYearRecord <- rbind(sim$climateYearRecord, 
                                      data.table(simYear = time(sim), 
