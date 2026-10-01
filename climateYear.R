@@ -55,6 +55,10 @@ defineModule(sim, list(
                   desc = "a year from projectedClimateRasters, updated annually"),
     createsOutput(objectName = "climateYearRecord", objectClass = "data.table", 
                   desc = "record of which climate year was used for which simulation year"),
+    createsOutput(objectName = "climateYearsUsed", objectClass = "data.table",
+                  desc = paste("one row per simulation year and climate variable: the climate year used,",
+                               "whether it came from historical or projected rasters, the source file and",
+                               "layer name it was read from, and the per-year file written (`yearFile`)")),
     createsOutput(objectName = "currentClimateRasters", objectClass = "SpatRaster", 
                   desc= "a single-year subset of projected or historical rasters")
   )
@@ -89,23 +93,30 @@ doEvent.climateYear = function(sim, eventTime, eventType) {
       #prioritize historical rasters
       rasToGet <- paste0("year", sim$climateYear)
       if (any(rasToGet %in% names(sim$historicalClimateRasters[[1]]))) {
-        sim$currentClimateRasters <- lapply(sim$historicalClimateRasters, "[[", rasToGet) |>
-          rast()
+        srcRasters <- sim$historicalClimateRasters
+        srcType <- "historical"
       } else {
-        sim$currentClimateRasters <- lapply(sim$projectedClimateRasters, "[[", rasToGet) |> 
-          rast()
+        srcRasters <- sim$projectedClimateRasters
+        srcType <- "projected"
       }
+      sim$currentClimateRasters <- lapply(srcRasters, "[[", rasToGet) |> rast()
+      srcFiles <- vapply(srcRasters, function(x) paste(unique(Filenames(x)), collapse = ";"), character(1))
       
       fns <- Filenames(sim$currentClimateRasters)
       fn <- file.path(unique(dirname(fns)), 
                       paste0(paste(rasToGet, sim$.runName, Sys.getpid(), sep = "_"), ".tif"))
-      ## only the current year's file is kept: remove the previous year's before writing this one
-      if (!is.null(mod$currentFile) && file.exists(mod$currentFile)) {
-        unlink(mod$currentFile)
-      }
       sim$currentClimateRasters <- writeRaster(sim$currentClimateRasters, 
                                                filename = fn, overwrite = TRUE)
-      mod$currentFile <- fn
+      
+      ## one row per climate variable, so it is known later which climate each simulation year used
+      sim$climateYearsUsed <- rbind(sim$climateYearsUsed,
+                                    data.table(simYear = time(sim),
+                                               climateYear = sim$climateYear,
+                                               source = srcType,
+                                               variable = if (is.null(names(srcRasters))) as.character(seq_along(srcRasters)) else names(srcRasters),
+                                               sourceFile = unname(srcFiles),
+                                               layer = rasToGet,
+                                               yearFile = normalizePath(fn, mustWork = FALSE)))
       
       sim$climateYearRecord <- rbind(sim$climateYearRecord, 
                                      data.table(simYear = time(sim), 
@@ -123,6 +134,10 @@ Init <- function(sim) {
 
  #make climateYearRecord
  sim$climateYearRecord <- data.table(simYear = numeric(0), climateYear = numeric(0)) 
+ sim$climateYearsUsed <- data.table(simYear = numeric(0), climateYear = numeric(0),
+                                    source = character(0), variable = character(0),
+                                    sourceFile = character(0), layer = character(0),
+                                    yearFile = character(0))
  
  return(invisible(sim))
 }

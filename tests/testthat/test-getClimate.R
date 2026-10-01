@@ -1,7 +1,8 @@
-test_that("getClimate keeps only the current year's file and returns the same layers", {
+test_that("getClimate keeps every year's file and records the climate each year used", {
   skip_if_not_installed("SpaDES.core")
   skip_if_not_installed("terra")
   library(SpaDES.core)
+  library(data.table)
 
   modDir <- normalizePath(file.path(testthat::test_path(), "..", ".."))
   mp <- withr::local_tempdir()
@@ -20,7 +21,6 @@ test_that("getClimate keeps only the current year's file and returns the same la
   }
   proj <- list(CMD = mk(0), MDC = mk(1000))
 
-  ## the same year sampled every time, and years that differ
   for (params in list(list(samplingRange = 2003), list(samplingRange = 2001:2005))) {
     unlink(list.files(climDir, pattern = "^year", full.names = TRUE))
     set.seed(1)
@@ -32,8 +32,34 @@ test_that("getClimate keeps only the current year's file and returns the same la
     )
     sim <- spades(sim, debug = FALSE)
 
-    expect_lte(length(list.files(climDir, pattern = "^year.*\\.tif$")), 1L)
+    used <- sim$climateYearsUsed
+    expect_equal(nrow(used), 4L * length(proj)) ## 4 simulation years x 2 variables
+    expect_identical(sort(unique(used$simYear)), as.numeric(2001:2004))
+    expect_identical(unique(used$source), "projected")
+    expect_setequal(used$variable, names(proj))
+    ## the table agrees with climateYearRecord, and names the layer and source files
+    rec <- sim$climateYearRecord
+    expect_equal(unique(used[, c("simYear", "climateYear")])[order(simYear)]$climateYear,
+                 rec[order(simYear)]$climateYear)
+    expect_identical(used$layer, paste0("year", used$climateYear))
+    expect_true(all(basename(used[variable == "CMD"]$sourceFile) == "var0_projected_x.tif"))
+    if (length(params$samplingRange) == 1L) {
+      expect_true(all(used$climateYear == params$samplingRange)) ## a single-year range
+    }
 
+    ## every year's file is kept: one per climate year used (a repeated year shares its file)
+    yearFiles <- list.files(climDir, pattern = "^year.*\\.tif$", full.names = TRUE)
+    expect_equal(length(yearFiles), length(unique(used$climateYear)))
+    expect_setequal(normalizePath(yearFiles), unique(used$yearFile))
+    ## and each holds that climate year's layers from the source stacks
+    for (cy in unique(used$climateYear)) {
+      f <- unique(used[climateYear == cy]$yearFile)
+      expect_equal(terra::values(terra::rast(f)),
+                   terra::values(terra::rast(lapply(proj, "[[", paste0("year", cy)))),
+                   tolerance = 0)
+    }
+
+    ## layers returned in the last year are unchanged
     yr <- paste0("year", sim$climateYear)
     expected <- terra::rast(lapply(proj, "[[", yr))
     expect_equal(terra::values(sim$currentClimateRasters), terra::values(expected), tolerance = 0)
