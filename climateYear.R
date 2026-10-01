@@ -16,7 +16,7 @@ defineModule(sim, list(
   loadOrder = list(before = c("fireSense_dataPrepPredict")),
   citation = list("citation.bib"),
   documentation = list("NEWS.md", "README.md", "climateYear.Rmd"),
-  reqdPkgs = list("SpaDES.core (>= 2.1.8.9999)", "ggplot2", "sf", "terra"),
+  reqdPkgs = list("SpaDES.core (>= 2.1.8.9999)", "ggplot2", "sf", "terra", "data.table"),
   parameters = bindrows(
     #defineParameter("paramName", "paramClass", value, min, max, "parameter description"),
     defineParameter(".studyAreaName", "character", NA, NA, NA,
@@ -60,7 +60,8 @@ defineModule(sim, list(
                                "whether it came from historical or projected rasters, the source file (`sourceFile`),",
                                "its md5 checksum (`sourceMd5`, taken the first time the file is used in a run)",
                                "and layer name it was read from, and the per-year file (`yearFile`, a .vrt",
-                               "that points at the source band)")),
+                               "in `file.path(outputPath(sim), \"climate\")` that points at the source band).",
+                               "Also written to `climateYearsUsed.csv` in `outputPath(sim)` every year")),
     createsOutput(objectName = "currentClimateRasters", objectClass = "SpatRaster", 
                   desc= "a single-year subset of projected or historical rasters")
   )
@@ -104,17 +105,18 @@ doEvent.climateYear = function(sim, eventTime, eventType) {
       currentLyrs <- lapply(srcRasters, "[[", rasToGet) |> rast()
       srcFiles <- vapply(srcRasters, function(x) paste(unique(Filenames(x)), collapse = ";"), character(1))
       
-      ## Each simulation year gets its own small .vrt that points at the source stack's band
-      ## (no pixels are copied). Sources that are not single files on disk are written to a .tif.
-      fns <- Filenames(currentLyrs)
-      fnStem <- paste(rasToGet, sim$.runName, Sys.getpid(), sep = "_")
-      fn <- file.path(unique(dirname(fns)), paste0(fnStem, ".vrt"))
-      if (length(fn) == 1L &&
-          buildYearVrt(srcRasters, rasToGet, names(currentLyrs), fn)) {
+      ## Each simulation year gets its own small .vrt in the run's outputPath that points at the
+      ## source stack's band (no pixels are copied). Sources that are not single files on disk
+      ## are written to a .tif instead.
+      climDir <- file.path(outputPath(sim), "climate")
+      dir.create(climDir, recursive = TRUE, showWarnings = FALSE)
+      fnStem <- file.path(climDir, paste0("climate_simYear", time(sim), "_climYear", sim$climateYear))
+      fn <- paste0(fnStem, ".vrt")
+      if (buildYearVrt(srcRasters, rasToGet, names(currentLyrs), fn)) {
         sim$currentClimateRasters <- rast(fn)
         names(sim$currentClimateRasters) <- names(currentLyrs)
       } else {
-        fn <- file.path(unique(dirname(fns)), paste0(fnStem, ".tif"))
+        fn <- paste0(fnStem, ".tif")
         sim$currentClimateRasters <- writeRaster(currentLyrs, filename = fn, overwrite = TRUE)
       }
       
@@ -138,6 +140,14 @@ doEvent.climateYear = function(sim, eventTime, eventType) {
                                                sourceMd5 = unname(srcMd5),
                                                layer = rasToGet,
                                                yearFile = normalizePath(fn, mustWork = FALSE)))
+      
+      ## The whole table is rewritten every year (to a temporary file, then renamed), so a killed
+      ## run leaves a complete CSV of the finished years; appending could leave a partial last line
+      ## and would duplicate rows if a run restarts into the same outputPath.
+      csv <- file.path(outputPath(sim), "climateYearsUsed.csv")
+      csvTmp <- paste0(csv, ".tmp")
+      data.table::fwrite(sim$climateYearsUsed, csvTmp)
+      file.rename(csvTmp, csv)
       
       sim$climateYearRecord <- rbind(sim$climateYearRecord, 
                                      data.table(simYear = time(sim), 

@@ -47,7 +47,7 @@ test_that("getClimate writes a small .vrt per year, keeps every year, and record
   proj <- list(CMD = mk(0, 2001:2005), MDC = mk(1000, 2005:2001))
 
   for (params in list(list(samplingRange = 2003), list(samplingRange = 2001:2005))) {
-    unlink(list.files(climDir, pattern = "^year", full.names = TRUE))
+    unlink(file.path(mp, "out"), recursive = TRUE)
     sim <- spades(setupSim(params, proj, mp), debug = FALSE)
 
     used <- sim$climateYearsUsed
@@ -64,20 +64,50 @@ test_that("getClimate writes a small .vrt per year, keeps every year, and record
       expect_true(all(used$climateYear == params$samplingRange)) ## a single-year range
     }
 
-    ## checksum of each source stack and the .vrt of each year
+    ## checksum of each source stack
     expect_identical(used$sourceMd5, unname(tools::md5sum(used$sourceFile)))
+
+    ## one .vrt per simulation year in outputPath/climate, named by simulation and climate year
+    outDir <- file.path(mp, "out")
     expect_true(all(grepl("\\.vrt$", used$yearFile)))
-    yearFiles <- list.files(climDir, pattern = "^year.*\\.vrt$", full.names = TRUE)
-    expect_equal(length(yearFiles), length(unique(used$climateYear)))
-    expect_setequal(normalizePath(yearFiles), unique(used$yearFile))
-    expect_length(list.files(climDir, pattern = "^year.*\\.tif$"), 0L)
-    expect_true(all(file.size(yearFiles) < 5000)) ## a pointer, not a copy of the pixels
+    expected <- file.path(normalizePath(outDir), "climate",
+                          sprintf("climate_simYear%d_climYear%d.vrt", rec$simYear, rec$climateYear))
+    expect_setequal(used$yearFile, expected)
+    vrts <- list.files(file.path(outDir, "climate"), full.names = TRUE)
+    expect_equal(length(vrts), 4L)
+    expect_setequal(normalizePath(vrts), expected)
+    expect_length(list.files(climDir, pattern = "^(year|climate_).*\\.(vrt|tif)$"), 0L)
+    expect_true(all(file.size(vrts) < 5000)) ## a pointer, not a copy of the pixels
+
+    ## the CSV in outputPath has every row of the table
+    csv <- file.path(outDir, "climateYearsUsed.csv")
+    expect_true(file.exists(csv))
+    fromCsv <- data.table::fread(csv, colClasses = list(character = c("sourceMd5")))
+    expect_identical(names(fromCsv), names(used))
+    expect_equal(nrow(fromCsv), 4L * length(proj))
+    expect_equal(as.data.frame(fromCsv), as.data.frame(used), tolerance = 0)
+
+    ## a fresh R process recovers each year's climate from the CSV and .vrt alone
+    skip_if_not_installed("callr")
+    fresh <- callr::r(function(csv) {
+      u <- data.table::fread(csv)
+      lapply(split(u, u$simYear), function(d) {
+        v <- terra::rast(unique(d$yearFile))
+        list(climateYear = unique(d$climateYear), values = terra::values(v), names = names(v))
+      })
+    }, args = list(csv = csv))
+    expect_length(fresh, 4L)
+    for (k in names(fresh)) {
+      lyrs <- terra::rast(lapply(proj, "[[", paste0("year", fresh[[k]]$climateYear)))
+      expect_equal(fresh[[k]]$values, terra::values(lyrs), tolerance = 0)
+      expect_identical(fresh[[k]]$names, names(proj))
+    }
 
     ## each year's .vrt reads the same values, names, extent and crs as a copy of that year's layers
     digs <- vapply(unique(used$climateYear), function(cy) {
       lyrs <- terra::rast(lapply(proj, "[[", paste0("year", cy)))
       copy <- terra::writeRaster(lyrs, withr::local_tempfile(fileext = ".tif"))
-      f <- unique(used[climateYear == cy]$yearFile)
+      f <- used[climateYear == cy]$yearFile[1]
       v <- terra::rast(f)
       expect_equal(terra::values(v), terra::values(copy), tolerance = 0)
       expect_identical(names(v), names(copy)) ## names are stored in the .vrt
