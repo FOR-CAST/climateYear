@@ -153,7 +153,7 @@ sampleYear <- function(Range, Starting, Ending, Time, Available) {
   if (Time %in% Range) {
     theYear <- Time
   } else {
-    theYear <- sample(Range, size = 1)
+    theYear <- Range[sample.int(length(Range), 1L)] ## `sample(Range)` samples 1:Range if length 1
   }
   
   

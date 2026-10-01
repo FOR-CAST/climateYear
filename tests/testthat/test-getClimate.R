@@ -20,8 +20,8 @@ test_that("getClimate keeps only the current year's file and returns the same la
   }
   proj <- list(CMD = mk(0), MDC = mk(1000))
 
-  ## the same year sampled every time, and years that differ (a single-value range is avoided: `sample()` of one number)
-  for (params in list(list(samplingRange = c(2003, 2003)), list(samplingRange = 2001:2005))) {
+  ## the same year sampled every time, and years that differ
+  for (params in list(list(samplingRange = 2003), list(samplingRange = 2001:2005))) {
     unlink(list.files(climDir, pattern = "^year", full.names = TRUE))
     set.seed(1)
     sim <- simInit(
