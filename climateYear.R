@@ -16,7 +16,7 @@ defineModule(sim, list(
   loadOrder = list(before = c("fireSense_dataPrepPredict")),
   citation = list("citation.bib"),
   documentation = list("NEWS.md", "README.md", "climateYear.Rmd"),
-  reqdPkgs = list("SpaDES.core (>= 2.1.8.9999)", "data.table", "ggplot2", "terra"),
+  reqdPkgs = list("SpaDES.core (>= 2.1.8.9999)", "data.table", "ggplot2", "terra", "sf"),
   parameters = bindrows(
     #defineParameter("paramName", "paramClass", value, min, max, "parameter description"),
     defineParameter(".studyAreaName", "character", NA, NA, NA,
@@ -55,6 +55,13 @@ defineModule(sim, list(
                   desc = "a year from projectedClimateRasters, updated annually"),
     createsOutput(objectName = "climateYearRecord", objectClass = "data.table", 
                   desc = "record of which climate year was used for which simulation year"),
+    createsOutput(objectName = "climateYearsUsed", objectClass = "data.table",
+                  desc = paste("one row per simulation year and climate variable: the climate year used,",
+                               "whether it came from historical or projected rasters, the source file (`sourceFile`),",
+                               "its md5 checksum (`sourceMd5`, taken the first time the file is used in a run)",
+                               "and layer name it was read from, and the per-year file (`yearFile`, a .vrt",
+                               "in `file.path(outputPath(sim), \"climate\")` that points at the source band).",
+                               "Also written to `climateYearsUsed.csv` in `outputPath(sim)` every year")),
     createsOutput(objectName = "currentClimateRasters", objectClass = "SpatRaster", 
                   desc= "a single-year subset of projected or historical rasters")
   )
@@ -89,18 +96,58 @@ doEvent.climateYear = function(sim, eventTime, eventType) {
       #prioritize historical rasters
       rasToGet <- paste0("year", sim$climateYear)
       if (any(rasToGet %in% names(sim$historicalClimateRasters[[1]]))) {
-        sim$currentClimateRasters <- lapply(sim$historicalClimateRasters, "[[", rasToGet) |>
-          rast()
+        srcRasters <- sim$historicalClimateRasters
+        srcType <- "historical"
       } else {
-        sim$currentClimateRasters <- lapply(sim$projectedClimateRasters, "[[", rasToGet) |> 
-          rast()
+        srcRasters <- sim$projectedClimateRasters
+        srcType <- "projected"
+      }
+      currentLyrs <- lapply(srcRasters, "[[", rasToGet) |> rast()
+      srcFiles <- vapply(srcRasters, function(x) paste(unique(Filenames(x)), collapse = ";"), character(1))
+      
+      ## Each simulation year gets its own small .vrt in the run's outputPath that points at the
+      ## source stack's band (no pixels are copied). Sources that are not single files on disk
+      ## are written to a .tif instead.
+      climDir <- file.path(outputPath(sim), "climate")
+      dir.create(climDir, recursive = TRUE, showWarnings = FALSE)
+      fnStem <- file.path(climDir, paste0("climate_simYear", time(sim), "_climYear", sim$climateYear))
+      fn <- paste0(fnStem, ".vrt")
+      if (buildYearVrt(srcRasters, rasToGet, names(currentLyrs), fn)) {
+        sim$currentClimateRasters <- rast(fn)
+        names(sim$currentClimateRasters) <- names(currentLyrs)
+      } else {
+        fn <- paste0(fnStem, ".tif")
+        sim$currentClimateRasters <- writeRaster(currentLyrs, filename = fn, overwrite = TRUE)
       }
       
-      fns <- Filenames(sim$currentClimateRasters)
-      fn <- file.path(unique(dirname(fns)), 
-                      paste0(paste(rasToGet, sim$.runName, Sys.getpid(), sep = "_"), ".tif"))
-      sim$currentClimateRasters <- writeRaster(sim$currentClimateRasters, 
-                                               filename = fn, overwrite = TRUE)
+      ## md5 of a source stack can be multi-GB: compute it once per file per run
+      srcMd5 <- vapply(srcFiles, function(srcF) {
+        files <- strsplit(srcF, ";", fixed = TRUE)[[1]]
+        files <- files[nzchar(files) & file.exists(files)]
+        if (!length(files)) return(NA_character_)
+        newF <- setdiff(files, names(mod$md5))
+        if (length(newF)) mod$md5[newF] <- unname(tools::md5sum(newF))
+        paste(mod$md5[files], collapse = ";")
+      }, character(1))
+      
+      ## one row per climate variable, so it is known later which climate each simulation year used
+      sim$climateYearsUsed <- rbind(sim$climateYearsUsed,
+                                    data.table(simYear = time(sim),
+                                               climateYear = sim$climateYear,
+                                               source = srcType,
+                                               variable = if (is.null(names(srcRasters))) as.character(seq_along(srcRasters)) else names(srcRasters),
+                                               sourceFile = unname(srcFiles),
+                                               sourceMd5 = unname(srcMd5),
+                                               layer = rasToGet,
+                                               yearFile = normalizePath(fn, mustWork = FALSE)))
+      
+      ## The whole table is rewritten every year (to a temporary file, then renamed), so a killed
+      ## run leaves a complete CSV of the finished years; appending could leave a partial last line
+      ## and would duplicate rows if a run restarts into the same outputPath.
+      csv <- file.path(outputPath(sim), "climateYearsUsed.csv")
+      csvTmp <- paste0(csv, ".tmp")
+      data.table::fwrite(sim$climateYearsUsed, csvTmp)
+      file.rename(csvTmp, csv)
       
       sim$climateYearRecord <- rbind(sim$climateYearRecord, 
                                      data.table(simYear = time(sim), 
@@ -115,9 +162,15 @@ doEvent.climateYear = function(sim, eventTime, eventType) {
 
 ### template initialization
 Init <- function(sim) {
+ mod$md5 <- character(0) ## md5 of each source stack file, filled as files are first used
 
  #make climateYearRecord
  sim$climateYearRecord <- data.table(simYear = numeric(0), climateYear = numeric(0)) 
+ sim$climateYearsUsed <- data.table(simYear = numeric(0), climateYear = numeric(0),
+                                    source = character(0), variable = character(0),
+                                    sourceFile = character(0), sourceMd5 = character(0),
+                                    layer = character(0),
+                                    yearFile = character(0))
  
  return(invisible(sim))
 }
@@ -129,6 +182,41 @@ Save <- function(sim) {
 
   # ! ----- STOP EDITING ----- ! #
   return(invisible(sim))
+}
+
+## Writes a .vrt at `vrtFile` with one band per variable: band `layerName` of each variable's
+## source stack, with its layer name (`lyrNames`) as band description. Source paths are absolute,
+## so the .vrt stays valid if it is copied. Returns FALSE (and writes nothing) if a variable is
+## not a single file on disk, lacks the layer, or the grids differ.
+buildYearVrt <- function(srcRasters, layerName, lyrNames, vrtFile) {
+  files <- vapply(srcRasters, function(x) {
+    f <- unique(Filenames(x))
+    if (length(f) == 1L && nzchar(f) && file.exists(f)) normalizePath(f) else NA_character_
+  }, character(1))
+  bands <- vapply(srcRasters, function(x) match(layerName, names(x)), integer(1))
+  if (anyNA(files) || anyNA(bands)) return(FALSE)
+  
+  parts <- lapply(seq_along(files), function(i) {
+    tmp <- tempfile(fileext = ".vrt")
+    on.exit(unlink(tmp))
+    sf::gdal_utils("buildvrt", files[i], tmp, options = c("-b", bands[i]), quiet = TRUE)
+    x <- paste(readLines(tmp, warn = FALSE), collapse = "\n")
+    bandStart <- regexpr("<VRTRasterBand", x, fixed = TRUE)
+    list(header = substr(x, 1L, bandStart - 1L),
+         band = sub("\\s*</VRTDataset>\\s*$", "", substring(x, bandStart)))
+  })
+  if (length(unique(vapply(parts, function(p) p$header, character(1)))) != 1L) return(FALSE)
+  
+  esc <- function(z) gsub(">", "&gt;", gsub("<", "&lt;", gsub("&", "&amp;", z, fixed = TRUE), fixed = TRUE), fixed = TRUE)
+  bandsXml <- vapply(seq_along(parts), function(i) {
+    b <- parts[[i]]$band
+    b <- sub("band=\"[0-9]+\"", paste0("band=\"", i, "\""), b)
+    b <- sub("(<VRTRasterBand[^>]*>)", paste0("\\1\n    <Description>", esc(lyrNames[i]), "</Description>"), b)
+    sub("<SourceFilename[^>]*>[^<]*</SourceFilename>",
+        paste0("<SourceFilename relativeToVRT=\"0\">", esc(files[i]), "</SourceFilename>"), b)
+  }, character(1))
+  writeLines(paste0(parts[[1]]$header, paste(bandsXml, collapse = "\n"), "\n</VRTDataset>"), vrtFile)
+  TRUE
 }
 
 sampleYear <- function(Range, Starting, Ending, Time, Available) {
@@ -148,7 +236,7 @@ sampleYear <- function(Range, Starting, Ending, Time, Available) {
   if (Time %in% Range) {
     theYear <- Time
   } else {
-    theYear <- sample(Range, size = 1)
+    theYear <- Range[sample.int(length(Range), 1L)] ## `sample(Range)` samples 1:Range if length 1
   }
   
   
